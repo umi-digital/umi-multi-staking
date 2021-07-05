@@ -1,0 +1,23 @@
+[
+    {
+        "nftId": 18,
+        "mintage": 100,
+        "nftName": "Polkaswap Temple",
+        "apy": 2,
+        "category": 1
+    },
+    {
+        "nftId": 19,
+        "mintage": 100,
+        "nftName": "Pswap v Sakura",
+        "apy": 2,
+        "category": 1
+    },
+    {
+        "nftId": 19,
+        "mintage": 100,
+        "nftName": "Fuji",
+        "apy": 2,
+        "category": 1
+    }
+]
