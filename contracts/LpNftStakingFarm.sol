@@ -14,9 +14,9 @@ import "./Calculator.sol";
 import "./erc1155/ERC1155TokenReceiver.sol";
 
 /**
- * nft staking farm
+ * lp nft staking farm
  */
-contract NftStakingFarm is
+contract LpNftStakingFarm is
     Context,
     Ownable,
     ReentrancyGuard,
@@ -51,20 +51,16 @@ contract NftStakingFarm is
      * Emitted when a user unstakes erc20 tokens.
      * @param sender User address.
      * @param apy The apy of user.
-     * @param principal The principal of user.
      * @param balance The balance of user.
-     * @param unstakeAmount The actually unstake amount.
-     * @param totalWithInterest The amount of unstake tokens with interest.
+     * @param umiInterest The amount of interest(umi token).
      * @param timePassed TimePassed seconds.
      * @param timestamp The time when unstake tokens.
      */
     event Unstaked(
         address indexed sender,
         uint256 apy,
-        uint256 principal,
         uint256 balance,
-        uint256 unstakeAmount,
-        uint256 totalWithInterest,
+        uint256 umiInterest,
         uint256 timePassed,
         uint256 timestamp
     );
@@ -154,20 +150,22 @@ contract NftStakingFarm is
         uint256 claimTimestamp
     );
 
-    // input stake token
+    // lp token
+    ERC20Interface public lpToken;
+    // rewards token(umi token now)
     ERC20Interface public umiToken;
     // nft token contract
     IERC1155 public nftContract;
 
-    // ERC20 about
-    // the principal of user
-    mapping(address => uint256) public principal;
+    // lp token about
     // The stake balances of users, it will contains interest(user address->amount), input token is umi
     mapping(address => uint256) public balances;
     // The dates of users' stakes(user address->timestamp)
     mapping(address => uint256) public stakeDates;
     // The total staked amount
     uint256 public totalStaked;
+
+    // umi token about
     // The farming rewards of users(address => total amount)
     mapping(address => uint256) public funding;
     // The total farming rewards for users
@@ -191,15 +189,16 @@ contract NftStakingFarm is
     }
 
     // other constants
-    // base APY when staking just ERC20 umi token is 12%, only contract owner can modify it
-    uint256 public BASE_APY = 12; // stand for 12%
+    // base APY when staking just lp token is 33%, only contract owner can modify it
+    uint256 public BASE_APY = 33; // stand for 33%
 
-    constructor(address _tokenAddress, address _nftContract) {
+    constructor(address _umiAddress, address _lpAddress, address _nftContract) {
         require(
-            _tokenAddress.isContract() && _nftContract.isContract(),
-            "must be contract address"
+            _umiAddress.isContract() && _lpAddress.isContract() && _nftContract.isContract(),
+            "must use contract address"
         );
-        umiToken = ERC20Interface(_tokenAddress);
+        umiToken = ERC20Interface(_umiAddress);
+        lpToken = ERC20Interface(_lpAddress);
         nftContract = IERC1155(_nftContract);
         // initialize apys
         initApys();
@@ -237,7 +236,7 @@ contract NftStakingFarm is
     }
 
     /**
-     * This method is used to stake tokens(input token is ERC20).
+     * This method is used to stake tokens(input token is LpToken).
      * Note: It calls another internal "_stake" method. See its description.
      * @param _amount The amount to stake.
      */
@@ -246,17 +245,15 @@ contract NftStakingFarm is
     }
 
     /**
-     * Increases the user's principal, balance, totalStaked and updates the stake date.
+     * Increases the user's balance, totalStaked and updates the stake date.
      * @param _sender The address of the sender.
      * @param _amount The amount to stake.
      */
     function _stake(address _sender, uint256 _amount) internal {
-        require(_amount > 0, "_stake stake amount should be more than 0");
-        // recalculate balance of umi token, then stake umi token and update the stake date
-        recalculateBalance(_sender);
+        require(_amount > 0, "stake amount should be more than 0");
+        // calculate rewards of umi token
+        uint256 umiInterest = calculateUmiTokenRewards(_sender);
 
-        // increase principal
-        principal[_sender] = principal[_sender].add(_amount);
         // increase balances
         balances[_sender] = balances[_sender].add(_amount);
         // increase totalStaked
@@ -265,17 +262,34 @@ contract NftStakingFarm is
         stakeDates[_sender] = stakeTimestamp;
         // send staked event
         emit Staked(_sender, _amount, stakeTimestamp);
-        // transfer umi token to contract
+        // transfer lp token to contract
         require(
-            umiToken.transferFrom(msg.sender, address(this), _amount),
+            lpToken.transferFrom(_sender, address(this), _amount),
             "transfer failed"
         );
+        // Transfer umiToken interest to user
+        transferUmiInterest(_sender, umiInterest);
+    }
+    
+    /**
+     * Transfer umiToken interest to user.
+     */ 
+    function transferUmiInterest(address recipient, uint256 amount) internal {
+        if (amount <= 0) {
+            return;
+        }
+        // reduce total funding
+        totalFunding = totalFunding.sub(amount);
+        require(
+                umiToken.transfer(recipient, amount),
+                "transfer umi nterest failed"
+            );
     }
 
     /**
-     * This method is used to unstake all the amount of erc20 token.
+     * This method is used to unstake all the amount of lp token.
      * Note: It calls another internal "_unstake" method. See its description.
-     * Note: unstake erc20 token.
+     * Note: unstake lp token.
      */
     function unstake() external whenNotPaused nonReentrant {
         _unstake(msg.sender);
@@ -288,50 +302,51 @@ contract NftStakingFarm is
      * @param _sender The address of the sender.
      */
     function _unstake(address _sender) internal {
-        // get umi token balance of current user
+        // get lp token balance of current user
         uint256 balance = balances[msg.sender];
-        require(balance > 0, "_unstake: insufficient funds");
-        // calculate total balance with interest
+        require(balance > 0, "insufficient funds");
+        // calculate total balance with interest(the interest is umi token)
         (uint256 totalWithInterest, uint256 timePassed) =
             calculateRewardsAndTimePassed(_sender, 0);
         require(
             totalWithInterest > 0 && timePassed > 0,
-            "_unstake totalWithInterest<=0 or timePassed<=0"
+            "totalWithInterest<=0 or timePassed<=0"
         );
-        // invest principal of user
-        uint256 investPrincipal = principal[_sender];
-        // interest to be paid
-        uint256 interest = totalWithInterest.sub(investPrincipal);
-        // unstake amount
-        uint256 unstakeAmount = 0;
-        if (totalFunding >= interest) {
-            // total funding is enough to pay interest
-            unstakeAmount = totalWithInterest;
-            // reduce total funding
-            totalFunding = totalFunding.sub(interest);
-        } else {
-            // total funding is not enough to pay interest, the contract's UMI has been completely drained.
-            // make sure users can unstake their capital.
-            unstakeAmount = investPrincipal;
-        }
-        // update principal of user
-        principal[_sender] = 0;
         // update balance of user to 0
         balances[_sender] = 0;
+        // update date of stake
         stakeDates[_sender] = 0;
-        totalStaked = totalStaked.sub(investPrincipal);
+        // update totalStaked of lpToken
+        totalStaked = totalStaked.sub(balance);
+
+        // interest to be paid, rewards is umi token
+        uint256 interest = totalWithInterest.sub(balance);
+        uint256 umiInterestAmount = 0;
+        if (interest > 0 && totalFunding >= interest) {
+            // interest > 0 and total funding is enough to pay interest
+            umiInterestAmount = interest;
+            // reduce total funding
+            totalFunding = totalFunding.sub(interest);
+        }
+        // total funding is not enough to pay interest, the contract's UMI has been completely drained. make sure users can unstake their lp tokens.
+        // 1. rewards are paid in more umi
+        if (umiInterestAmount > 0) {
+            require(
+                umiToken.transfer(_sender, umiInterestAmount),
+                "_unstake umi transfer failed"
+            );
+        }
+        // 2. unstake lp token of user
         require(
-            umiToken.transfer(_sender, unstakeAmount),
-            "_unstake transfer failed"
+            lpToken.transfer(_sender, balance),
+            "_unstake: lp transfer failed"
         );
         // send event
         emit Unstaked(
             _sender,
             getTotalApyOfUser(_sender),
-            investPrincipal,
             balance,
-            unstakeAmount,
-            totalWithInterest,
+            umiInterestAmount,
             timePassed,
             _now()
         );
@@ -346,7 +361,7 @@ contract NftStakingFarm is
         uint256 value,
         bytes calldata data
     ) external whenNotPaused nonReentrant {
-        require(isInWhitelist(id), "nft id not in whitelist");
+        require(isInWhitelist(id), "stakeNft: nft id not in whitelist");
         _stakeNft(msg.sender, address(this), id, value, data);
     }
 
@@ -368,8 +383,10 @@ contract NftStakingFarm is
         uint256 _value,
         bytes calldata _data
     ) internal {
-        // recalculate balance of umi token
-        recalculateBalance(_from);
+        // calculate rewards of umi token
+        uint256 umiInterest = calculateUmiTokenRewards(_from);
+        // update stakeDate of user
+        stakeDates[_from] = balances[_from] > 0 ?  _now() : 0;
 
         // modify nftBalances of user
         nftBalances[_from][_id] = nftBalances[_from][_id].add(_value);
@@ -379,6 +396,8 @@ contract NftStakingFarm is
 
         // transfer nft token to this contract
         nftContract.safeTransferFrom(_from, _to, _id, _value, _data);
+        // Transfer umiToken interest to user
+        transferUmiInterest(_from, umiInterest);
         // send event
         emit NftStaked(_from, _id, _value, _now());
     }
@@ -421,8 +440,10 @@ contract NftStakingFarm is
         uint256[] memory _values,
         bytes calldata _data
     ) internal {
-        // recalculate balance of umi token
-        recalculateBalance(_from);
+        // calculate rewards of umi token
+        uint256 umiInterest = calculateUmiTokenRewards(_from);
+        // update stakeDate of user
+        stakeDates[_from] = balances[_from] > 0 ?  _now() : 0;
 
         // update data
         for (uint256 i = 0; i < _ids.length; i++) {
@@ -443,6 +464,8 @@ contract NftStakingFarm is
 
         // batch transfer nft tokens
         nftContract.safeBatchTransferFrom(_from, _to, _ids, _values, _data);
+        // Transfer umiToken interest to user
+        transferUmiInterest(msg.sender, umiInterest);
         // send event
         emit NftsBatchStaked(_from, _ids, _values, _now());
     }
@@ -477,8 +500,10 @@ contract NftStakingFarm is
         uint256 _value,
         bytes calldata _data
     ) internal {
-        // recalculate balance of umi token
-        recalculateBalance(msg.sender);
+        // calculate rewards of umi token
+        uint256 umiInterest = calculateUmiTokenRewards(msg.sender);
+        // update stakeDate of user
+        stakeDates[msg.sender] = balances[msg.sender] > 0 ?  _now() : 0;
 
         uint256 nftBalance = nftBalances[msg.sender][_id];
         require(
@@ -503,6 +528,8 @@ contract NftStakingFarm is
             _value,
             _data
         );
+        // Transfer umiToken interest to user
+        transferUmiInterest(msg.sender, umiInterest);
         // send event
         emit NftUnstaked(msg.sender, _id, _value, _now());
     }
@@ -546,8 +573,10 @@ contract NftStakingFarm is
         uint256[] calldata _values,
         bytes calldata _data
     ) internal {
-        // recalculate balance of umi token
-        recalculateBalance(msg.sender);
+        // calculate rewards of umi token
+        uint256 umiInterest = calculateUmiTokenRewards(_from);
+        // update stakeDate of user
+        stakeDates[_from] = balances[_from] > 0 ?  _now() : 0;
 
         // update data
         for (uint256 i = 0; i < _ids.length; i++) {
@@ -571,6 +600,8 @@ contract NftStakingFarm is
 
         // transfer nft token from this contract
         nftContract.safeBatchTransferFrom(_from, _to, _ids, _values, _data);
+        // Transfer umiToken interest to user
+        transferUmiInterest(msg.sender, umiInterest);
         // send event
         emit NftsBatchUnstaked(msg.sender, _ids, _values, _now());
     }
@@ -587,17 +618,13 @@ contract NftStakingFarm is
             totalWithInterest > 0 && timePassed >= 0,
             "calculate rewards and TimePassed error"
         );
-        // invest principal of user
-        uint256 investPrincipal = principal[msg.sender];
         // interest to be paid
-        uint256 interest = totalWithInterest.sub(investPrincipal);
+        uint256 interest = totalWithInterest.sub(balance);
         require(interest > 0, "claim interest must more than 0");
         require(totalFunding >= interest, "total funding not enough to pay interest");
         // enough to pay interest
         // reduce total funding
         totalFunding = totalFunding.sub(interest);
-        // balance of user is invest principal
-        balances[msg.sender] = investPrincipal;
         uint256 claimTimestamp = _now();
         // update stake date
         stakeDates[msg.sender] = claimTimestamp;
@@ -607,24 +634,21 @@ contract NftStakingFarm is
             "claim: transfer failed"
         );
         // send claim event
-        emit Claimed(msg.sender, investPrincipal, interest, claimTimestamp);
+        emit Claimed(msg.sender, balance, interest, claimTimestamp);
     }
 
     /**
-     * Recalculate user's balance.
+     * Calculate user's umiToken rewards.
      *
-     * Note: when should recalculate
-     * case 1: stake nft
-     * case 2: unstake nft
-     * case 3: stake erc20 token
+     * @param _from User address.
      */
-    function recalculateBalance(address _from) internal {
-        // if umi balance>0, should update user's umi balance, and update stake date
-        // get current umi token balance
+    function calculateUmiTokenRewards(address _from) public view returns(uint256) {
+        // if lpToken balance>0, pass time > 1day, should calculate rewards of umiToken.
+        // get current lp token balance
         uint256 balance = balances[_from];
         if (balance <= 0) {
-            // stake first time, balance is 0, donot need to recalculate balance
-            return;
+            // stake first time, balance is 0, donot need to calculate rewards.
+            return 0;
         }
         // calculate total balance with interest
         (uint256 totalWithInterest, uint256 timePassed) =
@@ -633,8 +657,8 @@ contract NftStakingFarm is
             totalWithInterest > 0 && timePassed >= 0,
             "calculate rewards and TimePassed error"
         );
-        balances[_from] = totalWithInterest;
-        stakeDates[_from] = _now();
+        // return rewards amount
+        return totalWithInterest.sub(balance);
     }
 
     /**
@@ -676,6 +700,15 @@ contract NftStakingFarm is
      */
     function getUmiBalance(address addr) public view returns (uint256) {
         return umiToken.balanceOf(addr);
+    }
+
+    /**
+     * Get lp token balance by address.
+     * @param addr The address of the account that needs to check the balance
+     * @return Return balance of lp token.
+     */
+    function getLpBalance(address addr) public view returns (uint256) {
+        return lpToken.balanceOf(addr);
     }
 
     /**
@@ -773,7 +806,7 @@ contract NftStakingFarm is
      * Note: apy will be an integer value, 40 stands for 40%
      */
     function setApyByTokenId(uint256 id, uint8 apy) public onlyOwner {
-        require(id > 0 && apy > 0, "nft and apy must > 0");
+        require(id > 0 && apy > 0, "setApyByTokenId: nft and apy must > 0");
         nftApys[id] = apy;
         emit NftApySet(id, apy, msg.sender);
     }

@@ -426,9 +426,6 @@ contract LpTokenFarm is Context, Ownable, ReentrancyGuard, Pausable {
         uint256 currentBalance = balances[_user][_id];
         uint256 amount = _amount == 0 ? currentBalance : _amount;
         uint256 stakeDate = stakeDates[_user][_id];
-        if (amount == 0 || stakeDate == 0) {
-            return (0, 0);
-        }
         // one day seconds
         uint256 oneDay = 1 days;
         // seconds
